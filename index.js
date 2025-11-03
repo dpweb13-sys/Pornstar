@@ -2,20 +2,7 @@
  * index.js
  * Single-file Telegram SMM Bot (Telegraf + MongoDB)
  *
- * Features included:
- * - Add Fund (QR + screenshot) -> admin verification
- * - Insta Likes (min 500) & Insta Views (min 1000)
- * - Manual pricing (per 1K) and service IDs configurable by admin
- * - Order placement (calls provider API), saves order history
- * - Balance auto-deduct and refund on provider fail
- * - Duplicate link prevention (per user per service until complete)
- * - Auto status checker (interval)
- * - My Orders, Profile, Admin Dashboard, Broadcast
- * - Group notification on each order (compact)
- * - Health endpoint for UptimeRobot
- * - Daily backup (simple JSON export)
- *
- * IMPORTANT: Fill .env values before running.
+ * All features preserved. Only syntax fixes applied.
  */
 
 import 'dotenv/config';
@@ -444,8 +431,76 @@ bot.command('broadcast', async (ctx) => {
 });
 
 // ---------- Auto Status Checker ----------
+// ---------- Auto Status Checker ----------
 async function runStatusChecker() {
   console.log('Status checker running every', STATUS_CHECK_INTERVAL_MIN, 'min');
   setInterval(async () => {
     try {
-      const pending = await Orders.find({ status: { $in: ['pending','processing'] } }).limit(2
+      const pending = await Orders.find({ status: { $in: ['pending','processing'] } }).limit(200).toArray();
+      for (const o of pending) {
+        const res = await providerStatus(o.order_id);
+        if (!res) continue;
+        const providerStatus = (res.status || res.result || '').toString().toLowerCase();
+        let status = o.status;
+        if (providerStatus.includes('completed') || providerStatus === 'completed') status = 'completed';
+        else if (providerStatus.includes('partial')) status = 'partial';
+        else if (providerStatus.includes('processing') || providerStatus.includes('in progress')) status = 'processing';
+        else if (providerStatus.includes('cancel') || providerStatus.includes('refunded')) status = 'cancelled';
+        if (status !== o.status) {
+          await Orders.updateOne({ _id: o._id }, { $set: { status, provider_status: providerStatus, updated_at: new Date() }});
+          if (status === 'completed') {
+            try { await bot.telegram.sendMessage(o.user_id, `🎉 Your Order #${o.order_id} has been completed!`); } catch(e){}
+          }
+          if (status === 'cancelled' || status === 'refunded') {
+            try {
+              await Users.updateOne({ user_id: o.user_id }, { $inc: { balance: o.cost }});
+              await bot.telegram.sendMessage(o.user_id, `💸 Your Order #${o.order_id} was cancelled/refunded. ₹${o.cost} has been returned to your balance.`);
+            } catch(e){ console.error('refund notify err', e); }
+          }
+        } else {
+          await Orders.updateOne({ _id: o._id }, { $set: { provider_status, updated_at: new Date() }});
+        }
+      }
+    } catch (e) {
+      console.error('Status checker loop error', e);
+    }
+  }, Math.max(1, STATUS_CHECK_INTERVAL_MIN) * 60 * 1000);
+}
+
+// ---------- Backup helper (simple JSON export) ----------
+async function backupDbOnce() {
+  try {
+    if (!fs.existsSync(BACKUP_PATH)) fs.mkdirSync(BACKUP_PATH, { recursive: true });
+    const usersArr = await Users.find({}).toArray();
+    const ordersArr = await Orders.find({}).toArray();
+    const now = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.writeFileSync(path.join(BACKUP_PATH, `users_${now}.json`), JSON.stringify(usersArr));
+    fs.writeFileSync(path.join(BACKUP_PATH, `orders_${now}.json`), JSON.stringify(ordersArr));
+    console.log('Backup saved at', BACKUP_PATH);
+  } catch(e) { console.error('Backup error', e); }
+}
+
+// ---------- Health endpoint (for UptimeRobot) ----------
+const app = express();
+app.get('/', (req, res) => res.send('OK - bot is alive'));
+app.get('/health', (req,res)=>res.send({ ok: true, time: new Date() }));
+app.listen(PORT, () => console.log('Health server running on port', PORT));
+
+// ---------- Start ----------
+(async () => {
+  try {
+    await initDb();
+    await bot.launch();
+    console.log('Bot started');
+    runStatusChecker();
+    setInterval(async () => { await backupDbOnce(); }, 24*60*60*1000);
+    await backupDbOnce();
+  } catch (e) {
+    console.error('Startup error', e);
+  }
+})();
+
+// graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
